@@ -30,8 +30,7 @@ PRICELIST_TEXT = (
 )
 
 EVENTS = {
-    "ev1": '15 февраля в 18:00 - "Love Languages"',
-    "ev2": '21 февраля в 13:00 - "Women support or protect women?"'
+    "ev1": '15 февраля в 19:00 - "ANTI-VALENTINE\'S DAY" FREE ENTRY'
 }
 
 def main_menu_kb():
@@ -50,7 +49,6 @@ def back_main_kb():
 def schedule_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text=EVENTS["ev1"], callback_data="ev1")
-    kb.button(text=EVENTS["ev2"], callback_data="ev2")
     kb.button(text="Назад", callback_data="back_main")
     kb.adjust(1)
     return kb.as_markup()
@@ -158,3 +156,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
