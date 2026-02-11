@@ -1,5 +1,6 @@
 import os
 import asyncio
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
@@ -98,10 +99,10 @@ async def schedule(c: CallbackQuery, bot: Bot):
     await c.message.edit_text("На какую встречу вы бы хотели записаться?", reply_markup=schedule_kb())
     await c.answer()
 
-@router.callback_query(F.data.in_({"ev1", "ev2"}))
+@router.callback_query(F.data == "ev1")
 async def signup(c: CallbackQuery, bot: Bot):
     uname = user_label(c.from_user)
-    event_text = EVENTS.get(c.data, c.data)
+    event_text = EVENTS["ev1"]
     await bot.send_message(ADMIN_CHAT_ID, f"‼️ {uname} (id={c.from_user.id}) хочет записаться на {event_text}")
     await c.message.answer(
         "Отлично! Я передала вашу заявку. Если хотите, напишите здесь вопрос или комментарий.",
@@ -134,7 +135,6 @@ async def admin_reply(m: Message, bot: Bot):
     uid = ADMIN_REPLY_MAP.get(rt.message_id)
     if uid:
         await bot.copy_message(chat_id=uid, from_chat_id=m.chat.id, message_id=m.message_id)
-        return
 
 @router.message()
 async def any_message(m: Message, bot: Bot):
@@ -145,7 +145,19 @@ async def any_message(m: Message, bot: Bot):
     copied = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
     ADMIN_REPLY_MAP[copied.message_id] = m.from_user.id
 
-async def main():
+async def start_health_server():
+    async def ok(_):
+        return web.Response(text="OK")
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+async def start_bot():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty")
     session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else AiohttpSession()
@@ -154,6 +166,11 @@ async def main():
     dp.include_router(router)
     await dp.start_polling(bot)
 
+async def main():
+    await start_health_server()
+    await start_bot()
+
 if __name__ == "__main__":
     asyncio.run(main())
+
 
