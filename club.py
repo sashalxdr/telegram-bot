@@ -1,6 +1,5 @@
 import os
 import asyncio
-import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -27,15 +26,6 @@ PROXY_URL = (
 
 router = Router()
 
-PRICELIST_TEXT = (
-    "PRICELIST\n\n"
-    "🍬посещение 1 встречи - 700 руб\n\n"
-    "🍕membership - 4, 6 и 8 встреч в месяц\n"
-    "4 встречи - 2400 руб. (600 х 4)\n"
-    "6 встреч - 3300 руб. (550 х 6)\n"
-    "8 встреч - 4000 руб. (500 х 8)"
-)
-
 def is_admin(chat_id: int) -> bool:
     return chat_id == ADMIN_CHAT_ID
 
@@ -45,16 +35,48 @@ def user_label(u) -> str:
     name = " ".join([x for x in [u.first_name, u.last_name] if x])
     return name if name else str(u.id)
 
+def fmt_dt(ts: int) -> str:
+    dt = datetime.fromtimestamp(ts, tz=MSK)
+    return dt.strftime("%d.%m.%Y %H:%M")
+
 def main_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="ПРАЙС", callback_data="menu:price")
     kb.button(text="Расписание", callback_data="menu:schedule")
-    kb.adjust(2)
+    kb.adjust(1)
     return kb.as_markup()
 
 def back_main_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="Назад", callback_data="menu:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def cancel_entry_btn_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Отменить запись", callback_data="user:cancel_menu")
+    kb.button(text="Назад", callback_data="menu:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def confirm_kb(event_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Да", callback_data=f"confirm:{event_id}:yes")
+    kb.button(text="Нет", callback_data=f"confirm:{event_id}:no")
+    kb.adjust(2)
+    return kb.as_markup()
+
+def admin_request_kb(event_id: int, user_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Подтвердить запись", callback_data=f"admin:approve:{event_id}:{user_id}")
+    kb.button(text="Отклонить", callback_data=f"admin:decline:{event_id}:{user_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def admin_events_kb(prefix: str, events_rows):
+    kb = InlineKeyboardBuilder()
+    for event_id, start_ts, title, capacity, remaining, link in events_rows:
+        left_text = "МЕСТ НЕТ" if remaining <= 0 else f"{remaining}/{capacity}"
+        kb.button(text=f"#{event_id} {fmt_dt(start_ts)} — {title} ({left_text})", callback_data=f"{prefix}:{event_id}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -68,6 +90,12 @@ async def db_init():
                 first_name TEXT,
                 last_name TEXT,
                 started_ts INTEGER
+            );
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_users(
+                user_id INTEGER PRIMARY KEY,
+                blocked_ts INTEGER NOT NULL
             );
         """)
         await db.execute("""
@@ -86,8 +114,7 @@ async def db_init():
                 user_id INTEGER NOT NULL,
                 event_id INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                created_ts INTEGER NOT NULL,
-                UNIQUE(user_id, event_id, status)
+                created_ts INTEGER NOT NULL
             );
         """)
         await db.execute("""
@@ -118,6 +145,22 @@ async def db_init():
         """)
         await db.commit()
 
+async def db_is_blocked(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM blocked_users WHERE user_id=? LIMIT 1", (user_id,))
+        return (await cur.fetchone()) is not None
+
+async def db_block_user(user_id: int):
+    now_ts = int(datetime.now(tz=MSK).timestamp())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO blocked_users(user_id, blocked_ts) VALUES(?,?)", (user_id, now_ts))
+        await db.commit()
+
+async def db_unblock_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM blocked_users WHERE user_id=?", (user_id,))
+        await db.commit()
+
 async def db_user_upsert(u):
     now_ts = int(datetime.now(tz=MSK).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
@@ -130,10 +173,7 @@ async def db_user_upsert(u):
 
 async def db_add_admin_map(admin_msg_id: int, user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO admin_map(admin_msg_id, user_id) VALUES(?,?)",
-            (admin_msg_id, user_id)
-        )
+        await db.execute("INSERT OR REPLACE INTO admin_map(admin_msg_id, user_id) VALUES(?,?)", (admin_msg_id, user_id))
         await db.commit()
 
 async def db_get_mapped_user(admin_msg_id: int):
@@ -146,10 +186,6 @@ async def db_all_users():
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id FROM users")
         return [r[0] for r in await cur.fetchall()]
-
-def fmt_dt(ts: int) -> str:
-    dt = datetime.fromtimestamp(ts, tz=MSK)
-    return dt.strftime("%d.%m.%Y %H:%M")
 
 async def db_list_events_future():
     now_ts = int(datetime.now(tz=MSK).timestamp())
@@ -239,19 +275,19 @@ async def db_signup_confirm(user_id: int, event_id: int):
         )
         await db.commit()
 
-async def db_signup_cancel(user_id: int, event_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE signups SET status='cancelled', confirm_status='no' WHERE user_id=? AND event_id=?",
-            (user_id, event_id)
-        )
-        await db.commit()
-
 async def db_set_confirm_status(user_id: int, event_id: int, status: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE signups SET confirm_status=? WHERE user_id=? AND event_id=?",
             (status, user_id, event_id)
+        )
+        await db.commit()
+
+async def db_set_signup_cancelled(user_id: int, event_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE signups SET status='cancelled', confirm_status='no' WHERE user_id=? AND event_id=?",
+            (user_id, event_id)
         )
         await db.commit()
 
@@ -267,8 +303,7 @@ async def db_event_decrement_remaining(event_id: int) -> bool:
         if rem <= 0:
             await db.execute("ROLLBACK;")
             return False
-        rem2 = rem - 1
-        await db.execute("UPDATE events SET remaining=? WHERE event_id=?", (rem2, event_id))
+        await db.execute("UPDATE events SET remaining=? WHERE event_id=?", (rem - 1, event_id))
         await db.commit()
         return True
 
@@ -330,6 +365,18 @@ async def db_cleanup_expired_events():
             await db.execute("DELETE FROM jobs WHERE event_id=?", (eid,))
         await db.commit()
 
+async def db_user_confirmed_future_events(user_id: int):
+    now_ts = int(datetime.now(tz=MSK).timestamp())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT e.event_id, e.start_ts, e.title, e.capacity, e.remaining, COALESCE(e.link,'') "
+            "FROM signups s JOIN events e ON e.event_id=s.event_id "
+            "WHERE s.user_id=? AND s.status='confirmed' AND e.start_ts>? "
+            "ORDER BY e.start_ts ASC",
+            (user_id, now_ts)
+        )
+        return await cur.fetchall()
+
 async def admin_send_user_log(bot: Bot, user_id: int, text: str):
     msg = await bot.send_message(ADMIN_CHAT_ID, text)
     await db_add_admin_map(msg.message_id, user_id)
@@ -340,36 +387,43 @@ async def build_schedule_kb():
     kb = InlineKeyboardBuilder()
     for event_id, start_ts, title, capacity, remaining, link in events:
         left_text = "МЕСТ НЕТ" if remaining <= 0 else f"мест: {remaining}"
-        btn_text = f"{fmt_dt(start_ts)} — {title} ({left_text})"
-        kb.button(text=btn_text, callback_data=f"signup:{event_id}")
+        kb.button(text=f"{fmt_dt(start_ts)} — {title} ({left_text})", callback_data=f"signup:{event_id}")
+    kb.button(text="Отменить запись", callback_data="user:cancel_menu")
     kb.button(text="Назад", callback_data="menu:back")
     kb.adjust(1)
     return kb.as_markup()
 
-def confirm_kb(event_id: int):
+async def build_user_cancel_kb(user_id: int):
+    rows = await db_user_confirmed_future_events(user_id)
     kb = InlineKeyboardBuilder()
-    kb.button(text="Да", callback_data=f"confirm:{event_id}:yes")
-    kb.button(text="Нет", callback_data=f"confirm:{event_id}:no")
-    kb.adjust(2)
-    return kb.as_markup()
-
-def admin_request_kb(event_id: int, user_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Подтвердить запись", callback_data=f"admin:approve:{event_id}:{user_id}")
-    kb.button(text="Отклонить", callback_data=f"admin:decline:{event_id}:{user_id}")
+    for event_id, start_ts, title, capacity, remaining, link in rows:
+        kb.button(text=f"{fmt_dt(start_ts)} — {title}", callback_data=f"user:cancel:{event_id}")
+    kb.button(text="Назад", callback_data="menu:back")
     kb.adjust(1)
-    return kb.as_markup()
+    return kb.as_markup(), rows
 
-def admin_events_kb(prefix: str, events_rows):
-    kb = InlineKeyboardBuilder()
-    for event_id, start_ts, title, capacity, remaining, link in events_rows:
-        left_text = "МЕСТ НЕТ" if remaining <= 0 else f"{remaining}/{capacity}"
-        kb.button(text=f"#{event_id} {fmt_dt(start_ts)} — {title} ({left_text})", callback_data=f"{prefix}:{event_id}")
-    kb.adjust(1)
-    return kb.as_markup()
+async def cancel_signup_flow(bot: Bot, user_id: int, event_id: int, by_admin: bool, admin_chat_id: int | None = None):
+    ev = await db_get_event(event_id)
+    if not ev:
+        return False, "Встреча недоступна."
+    _, start_ts, title, capacity, remaining, link = ev
+    s = await db_signup_get(user_id, event_id)
+    if not s or s[0] != "confirmed":
+        return False, "Пользователь не записан(а) на эту встречу."
+    await db_set_signup_cancelled(user_id, event_id)
+    await db_event_increment_remaining(event_id)
+    try:
+        await bot.send_message(user_id, f"Ваша запись отменена: {fmt_dt(start_ts)} — {title}")
+    except:
+        pass
+    if by_admin and admin_chat_id:
+        await bot.send_message(admin_chat_id, f"Отменено: пользователь (id={user_id}) — #{event_id} {fmt_dt(start_ts)} — {title}")
+    return True, f"Запись отменена: #{event_id} {fmt_dt(start_ts)} — {title}"
 
 @router.message(CommandStart())
 async def start(m: Message, bot: Bot):
+    if not is_admin(m.chat.id) and await db_is_blocked(m.from_user.id):
+        return
     await db_user_upsert(m.from_user)
     uname = user_label(m.from_user)
     await admin_send_user_log(bot, m.from_user.id, f"ℹ️ {uname} (id={m.from_user.id}) запустил(а) бота")
@@ -382,26 +436,57 @@ async def start(m: Message, bot: Bot):
 
 @router.callback_query(F.data == "menu:back")
 async def back_main(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
     await c.message.edit_text("Выберите то, что вас интересует или задайте вопрос в этом чате!", reply_markup=main_menu_kb())
-    await c.answer()
-
-@router.callback_query(F.data == "menu:price")
-async def price(c: CallbackQuery, bot: Bot):
-    uname = user_label(c.from_user)
-    await admin_send_user_log(bot, c.from_user.id, f"💳 {uname} (id={c.from_user.id}) открыл(а) ПРАЙС")
-    await c.message.edit_text(PRICELIST_TEXT, reply_markup=back_main_kb())
-    await c.message.answer("Какой формат вам больше подходит?", reply_markup=back_main_kb())
     await c.answer()
 
 @router.callback_query(F.data == "menu:schedule")
 async def schedule(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
+    await db_user_upsert(c.from_user)
     uname = user_label(c.from_user)
     await admin_send_user_log(bot, c.from_user.id, f"🗓️ {uname} (id={c.from_user.id}) открыл(а) Расписание")
     await c.message.edit_text("На какую встречу вы бы хотели записаться?", reply_markup=await build_schedule_kb())
     await c.answer()
 
+@router.callback_query(F.data == "user:cancel_menu")
+async def user_cancel_menu(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
+    kb, rows = await build_user_cancel_kb(c.from_user.id)
+    if not rows:
+        await c.message.answer("У вас нет активных записей на будущие встречи.", reply_markup=back_main_kb())
+        await c.answer()
+        return
+    await c.message.answer("Выберите встречу, которую хотите отменить:", reply_markup=kb)
+    await c.answer()
+
+@router.callback_query(F.data.startswith("user:cancel:"))
+async def user_cancel_pick(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
+    event_id = int(c.data.split(":")[2])
+    ok, msg = await cancel_signup_flow(bot, c.from_user.id, event_id, by_admin=False)
+    await c.message.answer(msg, reply_markup=back_main_kb())
+    if ok:
+        uname = user_label(c.from_user)
+        ev = await db_get_event(event_id)
+        if ev:
+            _, start_ts, title, *_ = ev
+            await admin_send_user_log(bot, c.from_user.id, f"❗ Отмена пользователем: {uname} (id={c.from_user.id}) отменил(а) #{event_id} {fmt_dt(start_ts)} — {title}")
+    await c.answer()
+
 @router.callback_query(F.data.startswith("signup:"))
 async def signup_request(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
     await db_user_upsert(c.from_user)
     event_id = int(c.data.split(":")[1])
     ev = await db_get_event(event_id)
@@ -420,7 +505,7 @@ async def signup_request(c: CallbackQuery, bot: Bot):
         return
     s = await db_signup_get(c.from_user.id, event_id)
     if s and s[0] == "confirmed":
-        await c.message.answer("Вы уже записаны на эту встречу.", reply_markup=back_main_kb())
+        await c.message.answer("Вы уже записаны на эту встречу.", reply_markup=cancel_entry_btn_kb())
         await c.answer()
         return
     await db_create_request(c.from_user.id, event_id)
@@ -464,7 +549,10 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
     _, start_ts, title, capacity, remaining, link = ev
     await c.message.edit_text(f"✅ Подтверждено: пользователь записан на #{event_id} {fmt_dt(start_ts)} — {title}")
 
-    await bot.send_message(user_id, f"Вы записаны на встречу: {fmt_dt(start_ts)} — {title}")
+    try:
+        await bot.send_message(user_id, f"Вы записаны на встречу: {fmt_dt(start_ts)} — {title}", reply_markup=cancel_entry_btn_kb())
+    except:
+        pass
 
     now_ts = int(datetime.now(tz=MSK).timestamp())
     confirm_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=24)).timestamp())
@@ -497,14 +585,23 @@ async def admin_decline(c: CallbackQuery, bot: Bot):
     if ev:
         _, start_ts, title, *_ = ev
         await c.message.edit_text(f"❌ Отклонено: заявка на #{event_id} {fmt_dt(start_ts)} — {title}")
-        await bot.send_message(user_id, f"К сожалению, вашу заявку на {fmt_dt(start_ts)} — {title} мы не подтвердили.")
+        try:
+            await bot.send_message(user_id, f"К сожалению, вашу заявку на {fmt_dt(start_ts)} — {title} мы не подтвердили.")
+        except:
+            pass
     else:
         await c.message.edit_text("❌ Отклонено: встреча уже недоступна.")
-        await bot.send_message(user_id, "К сожалению, вашу заявку мы не подтвердили.")
+        try:
+            await bot.send_message(user_id, "К сожалению, вашу заявку мы не подтвердили.")
+        except:
+            pass
     await c.answer()
 
 @router.callback_query(F.data.startswith("confirm:"))
 async def user_confirm(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
     _, event_id_s, ans = c.data.split(":")
     event_id = int(event_id_s)
     s = await db_signup_get(c.from_user.id, event_id)
@@ -522,7 +619,7 @@ async def user_confirm(c: CallbackQuery, bot: Bot):
         await admin_send_user_log(bot, c.from_user.id, f"✅ Подтверждение: {uname} (id={c.from_user.id}) подтвердил(а) участие в #{event_id} {fmt_dt(start_ts)} — {title}")
     else:
         await db_set_confirm_status(c.from_user.id, event_id, "no")
-        await db_signup_cancel(c.from_user.id, event_id)
+        await db_set_signup_cancelled(c.from_user.id, event_id)
         await db_event_increment_remaining(event_id)
         await c.message.edit_text("Жаль, что вы не сможете к нам прийти.")
         uname = user_label(c.from_user)
@@ -572,7 +669,7 @@ async def admin_add_event(m: Message, bot: Bot):
     txt = (m.text or "").strip()
     parts = txt.split(maxsplit=4)
     if len(parts) < 5:
-        await m.answer('Формат: /add_event YYYY-MM-DD HH:MM <места> <название>')
+        await m.answer("Формат: /add_event YYYY-MM-DD HH:MM <места> <название>")
         return
     date_s, time_s, cap_s, title = parts[1], parts[2], parts[3], parts[4]
     try:
@@ -580,7 +677,7 @@ async def admin_add_event(m: Message, bot: Bot):
         if cap <= 0:
             raise ValueError
     except:
-        await m.answer('Места должны быть числом > 0. Формат: /add_event YYYY-MM-DD HH:MM <места> <название>')
+        await m.answer("Места должны быть числом > 0. Формат: /add_event YYYY-MM-DD HH:MM <места> <название>")
         return
     try:
         dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M").replace(tzinfo=MSK)
@@ -670,6 +767,8 @@ async def admin_broadcast_all(m: Message, bot: Bot):
     sent = 0
     for uid in users:
         try:
+            if await db_is_blocked(uid):
+                continue
             await bot.send_message(uid, msg)
             sent += 1
         except:
@@ -682,7 +781,7 @@ async def admin_broadcast(m: Message, bot: Bot):
         return
     txt = (m.text or "").split(maxsplit=2)
     if len(txt) < 3:
-        await m.answer("Формат: /broadcast <user_ids через запятую или @username> <текст>\nПример: /broadcast 123,456,789 Привет!\nПример: /broadcast @user1,@user2 Привет!")
+        await m.answer("Формат: /broadcast <user_ids через запятую или @username> <текст>\nПример: /broadcast 123,456 Привет!\nПример: /broadcast @user1,@user2 Привет!")
         return
     who = txt[1]
     msg = txt[2]
@@ -703,17 +802,103 @@ async def admin_broadcast(m: Message, bot: Bot):
     sent = 0
     for uid in targets:
         try:
+            if await db_is_blocked(uid):
+                continue
             await bot.send_message(uid, msg)
             sent += 1
         except:
             pass
     await m.answer(f"Отправлено: {sent}/{len(targets)}")
 
+@router.message(Command("cancel_signup"))
+async def admin_cancel_signup(m: Message, bot: Bot):
+    if not is_admin(m.chat.id):
+        return
+    parts = (m.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await m.answer("Формат: /cancel_signup <event_id> <user_id или @username>")
+        return
+    if not parts[1].isdigit():
+        await m.answer("Формат: /cancel_signup <event_id> <user_id или @username>")
+        return
+    event_id = int(parts[1])
+    who = parts[2].strip()
+    user_id = None
+    if who.startswith("@"):
+        uname = who[1:]
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT user_id FROM users WHERE username=?", (uname,))
+            row = await cur.fetchone()
+            if row:
+                user_id = int(row[0])
+    else:
+        if who.isdigit():
+            user_id = int(who)
+    if not user_id:
+        await m.answer("Не найден пользователь. Укажите user_id или @username.")
+        return
+    ok, msg = await cancel_signup_flow(bot, user_id, event_id, by_admin=True, admin_chat_id=m.chat.id)
+    await m.answer(msg)
+
+@router.message(Command("block"))
+async def admin_block(m: Message, bot: Bot):
+    if not is_admin(m.chat.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Формат: /block <user_id или @username>")
+        return
+    who = parts[1].strip()
+    user_id = None
+    if who.startswith("@"):
+        uname = who[1:]
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT user_id FROM users WHERE username=?", (uname,))
+            row = await cur.fetchone()
+            if row:
+                user_id = int(row[0])
+    else:
+        if who.isdigit():
+            user_id = int(who)
+    if not user_id:
+        await m.answer("Не найден пользователь. Укажите user_id или @username.")
+        return
+    await db_block_user(user_id)
+    await m.answer(f"Пользователь заблокирован: id={user_id}")
+
+@router.message(Command("unblock"))
+async def admin_unblock(m: Message, bot: Bot):
+    if not is_admin(m.chat.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Формат: /unblock <user_id или @username>")
+        return
+    who = parts[1].strip()
+    user_id = None
+    if who.startswith("@"):
+        uname = who[1:]
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT user_id FROM users WHERE username=?", (uname,))
+            row = await cur.fetchone()
+            if row:
+                user_id = int(row[0])
+    else:
+        if who.isdigit():
+            user_id = int(who)
+    if not user_id:
+        await m.answer("Не найден пользователь. Укажите user_id или @username.")
+        return
+    await db_unblock_user(user_id)
+    await m.answer(f"Пользователь разблокирован: id={user_id}")
+
 @router.message()
 async def any_message(m: Message, bot: Bot):
-    await db_user_upsert(m.from_user)
     if is_admin(m.chat.id):
         return
+    if await db_is_blocked(m.from_user.id):
+        return
+    await db_user_upsert(m.from_user)
     uname = user_label(m.from_user)
     await admin_send_user_log(bot, m.from_user.id, f"✉️ Сообщение от {uname} (id={m.from_user.id})")
     copied = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
@@ -731,6 +916,9 @@ async def scheduler_loop(bot: Bot):
                 if not ev or not s or s[0] != "confirmed":
                     await db_mark_job_sent(job_id)
                     continue
+                if await db_is_blocked(user_id):
+                    await db_mark_job_sent(job_id)
+                    continue
                 _, start_ts, title, capacity, remaining, link = ev
                 if start_ts <= now_ts:
                     await db_mark_job_sent(job_id)
@@ -744,17 +932,10 @@ async def scheduler_loop(bot: Bot):
                     )
                 elif job_type == "reminder":
                     link_txt = (link or "").strip()
-                    if int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=1)).timestamp()) <= now_ts:
-                        if link_txt:
-                            await bot.send_message(user_id, f"Встреча скоро начнется: {fmt_dt(start_ts)} — {title}\nМесто проведения: {link_txt}")
-                        else:
-                            await bot.send_message(user_id, f"Встреча скоро начнется: {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)")
+                    if link_txt:
+                        await bot.send_message(user_id, f"Встреча скоро начнется: {fmt_dt(start_ts)} — {title}\nМесто проведения: {link_txt}")
                     else:
-                        if link_txt:
-                            await bot.send_message(user_id, f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: {link_txt}")
-                        else:
-                            await bot.send_message(user_id, f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)")
-
+                        await bot.send_message(user_id, f"Встреча скоро начнется: {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)")
                 await db_mark_job_sent(job_id)
         except:
             pass
