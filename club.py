@@ -26,6 +26,14 @@ PROXY_URL = (
 
 router = Router()
 
+DONATION_TEXT_HTML = (
+    "Нам очень приятно, что вы хотите записаться на эту встречу!\n"
+    "Теперь запись доступна по донату от 250 рублей - вы сами выбираете сумму.\n"
+    "РЕКВИЗИТЫ: номер карты 2200700476358261 Александра Ц.\n"
+    "❗️После перевода отправьте пожалуйста в чат скриншот о переводе❗️\n"
+    "<a href=\"https://t.me/femglow/36\">Почему теперь так?</a>"
+)
+
 def is_admin(chat_id: int) -> bool:
     return chat_id == ADMIN_CHAT_ID
 
@@ -353,6 +361,14 @@ async def db_event_stats(event_id: int):
         )
         return await cur.fetchall()
 
+async def db_event_confirmed_user_ids(event_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id FROM signups WHERE event_id=? AND status='confirmed'",
+            (event_id,)
+        )
+        return [r[0] for r in await cur.fetchall()]
+
 async def db_cleanup_expired_events():
     now_ts = int(datetime.now(tz=MSK).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
@@ -501,6 +517,7 @@ async def signup_request(c: CallbackQuery, bot: Bot):
         return
     if await db_has_pending_request(c.from_user.id, event_id):
         await c.message.answer("Ваша заявка уже отправлена. Мы скоро подтвердим.", reply_markup=back_main_kb())
+        await c.message.answer(DONATION_TEXT_HTML, parse_mode="HTML")
         await c.answer()
         return
     s = await db_signup_get(c.from_user.id, event_id)
@@ -517,6 +534,7 @@ async def signup_request(c: CallbackQuery, bot: Bot):
     )
     await db_add_admin_map(admin_msg.message_id, c.from_user.id)
     await c.message.answer("Заявка отправлена! Мы подтвердим и напишем вам здесь.", reply_markup=back_main_kb())
+    await c.message.answer(DONATION_TEXT_HTML, parse_mode="HTML")
     await c.answer()
 
 @router.callback_query(F.data.startswith("admin:approve:"))
@@ -550,7 +568,11 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
     await c.message.edit_text(f"✅ Подтверждено: пользователь записан на #{event_id} {fmt_dt(start_ts)} — {title}")
 
     try:
-        await bot.send_message(user_id, f"Вы записаны на встречу: {fmt_dt(start_ts)} — {title}", reply_markup=cancel_entry_btn_kb())
+        await bot.send_message(
+            user_id,
+            f"✅ Запись подтверждена! Спасибо за вашу поддержку 💛\nВы записаны на встречу: {fmt_dt(start_ts)} — {title}",
+            reply_markup=cancel_entry_btn_kb()
+        )
     except:
         pass
 
@@ -714,8 +736,27 @@ async def admin_set_link(m: Message, bot: Bot):
         return
     eid = int(parts[1])
     link = parts[2].strip()
+    ev = await db_get_event(eid)
+    if not ev:
+        await m.answer("Встреча не найдена.")
+        return
+    _, start_ts, title, capacity, remaining, old_link = ev
     await db_set_link(eid, link)
     await m.answer(f"Ссылка сохранена для #{eid}")
+
+    now_ts = int(datetime.now(tz=MSK).timestamp())
+    if 0 < (start_ts - now_ts) < 3600:
+        user_ids = await db_event_confirmed_user_ids(eid)
+        sent = 0
+        for uid in user_ids:
+            try:
+                if await db_is_blocked(uid):
+                    continue
+                await bot.send_message(uid, f"Место проведения встречи {fmt_dt(start_ts)} — {title}:\n{link}")
+                sent += 1
+            except:
+                pass
+        await m.answer(f"Ссылка разослана записанным: {sent}/{len(user_ids)}")
 
 @router.message(Command("stats"))
 async def admin_stats(m: Message, bot: Bot):
@@ -781,7 +822,7 @@ async def admin_broadcast(m: Message, bot: Bot):
         return
     txt = (m.text or "").split(maxsplit=2)
     if len(txt) < 3:
-        await m.answer("Формат: /broadcast <user_ids через запятую или @username> <текст>\nПример: /broadcast 123,456 Привет!\nПример: /broadcast @user1,@user2 Привет!")
+        await m.answer("Формат: /broadcast <user_ids через запятую или @username> <текст>")
         return
     who = txt[1]
     msg = txt[2]
@@ -809,6 +850,32 @@ async def admin_broadcast(m: Message, bot: Bot):
         except:
             pass
     await m.answer(f"Отправлено: {sent}/{len(targets)}")
+
+@router.message(Command("broadcast_event"))
+async def admin_broadcast_event(m: Message, bot: Bot):
+    if not is_admin(m.chat.id):
+        return
+    parts = (m.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await m.answer("Формат: /broadcast_event <event_id> <текст>")
+        return
+    event_id = int(parts[1])
+    msg = parts[2]
+    ev = await db_get_event(event_id)
+    if not ev:
+        await m.answer("Встреча не найдена.")
+        return
+    user_ids = await db_event_confirmed_user_ids(event_id)
+    sent = 0
+    for uid in user_ids:
+        try:
+            if await db_is_blocked(uid):
+                continue
+            await bot.send_message(uid, msg)
+            sent += 1
+        except:
+            pass
+    await m.answer(f"Отправлено записанным: {sent}/{len(user_ids)}")
 
 @router.message(Command("cancel_signup"))
 async def admin_cancel_signup(m: Message, bot: Bot):
