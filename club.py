@@ -26,14 +26,6 @@ PROXY_URL = (
 
 router = Router()
 
-DONATION_TEXT_HTML = (
-    "Нам очень приятно, что вы хотите записаться на эту встречу!\n"
-    "Теперь запись доступна по донату от 250 рублей - вы сами выбираете сумму.\n"
-    "РЕКВИЗИТЫ: номер карты 2200700476358261 Александра Ц.\n"
-    "❗️После перевода отправьте пожалуйста в чат скриншот о переводе❗️\n"
-    "<a href=\"https://t.me/femglow/36\">Почему теперь так?</a>"
-)
-
 def is_admin(chat_id: int) -> bool:
     return chat_id == ADMIN_CHAT_ID
 
@@ -44,12 +36,14 @@ def user_label(u) -> str:
     return name if name else str(u.id)
 
 def fmt_dt(ts: int) -> str:
-    dt = datetime.fromtimestamp(ts, tz=MSK)
-    return dt.strftime("%d.%m.%Y %H:%M")
+    return datetime.fromtimestamp(ts, tz=MSK).strftime("%d.%m.%Y %H:%M")
 
 def main_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="Расписание", callback_data="menu:schedule")
+    kb.button(text="📅Расписание и запись", callback_data="menu:schedule")
+    kb.button(text="📌Подробности про запись", url="https://t.me/femglow/43")
+    kb.button(text="🤩Как проходит встреча?", url="https://t.me/femglow/44")
+    kb.button(text="❓Задать вопрос", callback_data="menu:ask")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -87,6 +81,25 @@ def admin_events_kb(prefix: str, events_rows):
         kb.button(text=f"#{event_id} {fmt_dt(start_ts)} — {title} ({left_text})", callback_data=f"{prefix}:{event_id}")
     kb.adjust(1)
     return kb.as_markup()
+
+def payment_kb(event_id: int, include_reason: bool = True):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💳 ОПЛАТИТЬ", url="https://pay.cloudtips.ru/p/18eb8c24")
+    kb.button(text="✅ Я оплатила", callback_data=f"paydone:{event_id}")
+    if include_reason:
+        kb.button(text="❓Почему участие по донату?", url="https://t.me/femglow/36")
+    kb.button(text="🔙 К расписанию", callback_data="menu:schedule")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def payment_text_html(start_ts: int, title: str):
+    return (
+        "Вы выбрали встречу:\n"
+        f"<b>{fmt_dt(start_ts)} — {title}</b>\n\n"
+        "Чтобы закрепить за собой место, отправьте донат от 250 ₽.\n"
+        "Оплата по кнопке \"Оплатить\" или переводом на карту 2200700476358261 Александра Ц.\n"
+        "После оплаты нажмите кнопку “Я уже оплатила”"
+    )
 
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -151,6 +164,16 @@ async def db_init():
                 user_id INTEGER NOT NULL
             );
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments(
+                user_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                selected_ts INTEGER NOT NULL,
+                paid_clicked_ts INTEGER,
+                PRIMARY KEY(user_id, event_id)
+            );
+        """)
         await db.commit()
 
 async def db_is_blocked(user_id: int) -> bool:
@@ -204,6 +227,16 @@ async def db_list_events_future():
         )
         return await cur.fetchall()
 
+async def db_list_events_recent_for_admin():
+    now_ts = int(datetime.now(tz=MSK).timestamp())
+    old_ts = now_ts - 86400 * 30
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT event_id, start_ts, title, capacity, remaining, COALESCE(link,'') FROM events WHERE start_ts>? ORDER BY start_ts ASC",
+            (old_ts,)
+        )
+        return await cur.fetchall()
+
 async def db_get_event(event_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -227,6 +260,7 @@ async def db_delete_event(event_id: int):
         await db.execute("DELETE FROM requests WHERE event_id=?", (event_id,))
         await db.execute("DELETE FROM signups WHERE event_id=?", (event_id,))
         await db.execute("DELETE FROM jobs WHERE event_id=?", (event_id,))
+        await db.execute("DELETE FROM pending_payments WHERE event_id=?", (event_id,))
         await db.commit()
 
 async def db_set_link(event_id: int, link: str):
@@ -234,36 +268,14 @@ async def db_set_link(event_id: int, link: str):
         await db.execute("UPDATE events SET link=? WHERE event_id=?", (link, event_id))
         await db.commit()
 
-async def db_create_request(user_id: int, event_id: int):
+async def db_add_request_log(user_id: int, event_id: int, status: str):
     now_ts = int(datetime.now(tz=MSK).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO requests(user_id, event_id, status, created_ts) VALUES(?,?,?,?)",
-            (user_id, event_id, "pending", now_ts)
+            (user_id, event_id, status, now_ts)
         )
         await db.commit()
-
-async def db_has_pending_request(user_id: int, event_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM requests WHERE user_id=? AND event_id=? AND status='pending' LIMIT 1",
-            (user_id, event_id)
-        )
-        return (await cur.fetchone()) is not None
-
-async def db_mark_request(request_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE requests SET status=? WHERE request_id=?", (status, request_id))
-        await db.commit()
-
-async def db_find_pending_request(user_id: int, event_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT request_id FROM requests WHERE user_id=? AND event_id=? AND status='pending' ORDER BY created_ts DESC LIMIT 1",
-            (user_id, event_id)
-        )
-        row = await cur.fetchone()
-        return row[0] if row else None
 
 async def db_signup_get(user_id: int, event_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -338,7 +350,7 @@ async def db_add_job(job_type: str, user_id: int, event_id: int, run_ts: int):
         )
         await db.commit()
 
-async def db_next_jobs(now_ts: int, limit: int = 30):
+async def db_next_jobs(now_ts: int, limit: int = 50):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT job_id, job_type, user_id, event_id, run_ts FROM jobs WHERE sent=0 AND run_ts<=? ORDER BY run_ts ASC LIMIT ?",
@@ -369,16 +381,18 @@ async def db_event_confirmed_user_ids(event_id: int):
         )
         return [r[0] for r in await cur.fetchall()]
 
-async def db_cleanup_expired_events():
+async def db_cleanup_old_events():
     now_ts = int(datetime.now(tz=MSK).timestamp())
+    old_ts = now_ts - 86400 * 30
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT event_id FROM events WHERE start_ts<=?", (now_ts,))
+        cur = await db.execute("SELECT event_id FROM events WHERE start_ts<?", (old_ts,))
         rows = await cur.fetchall()
         for (eid,) in rows:
             await db.execute("DELETE FROM events WHERE event_id=?", (eid,))
             await db.execute("DELETE FROM requests WHERE event_id=?", (eid,))
             await db.execute("DELETE FROM signups WHERE event_id=?", (eid,))
             await db.execute("DELETE FROM jobs WHERE event_id=?", (eid,))
+            await db.execute("DELETE FROM pending_payments WHERE event_id=?", (eid,))
         await db.commit()
 
 async def db_user_confirmed_future_events(user_id: int):
@@ -393,6 +407,59 @@ async def db_user_confirmed_future_events(user_id: int):
         )
         return await cur.fetchall()
 
+async def db_payment_get(user_id: int, event_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT status, selected_ts, paid_clicked_ts FROM pending_payments WHERE user_id=? AND event_id=?",
+            (user_id, event_id)
+        )
+        return await cur.fetchone()
+
+async def db_payment_set_selected(user_id: int, event_id: int):
+    now_ts = int(datetime.now(tz=MSK).timestamp())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO pending_payments(user_id, event_id, status, selected_ts, paid_clicked_ts) VALUES(?,?,?,?,NULL) "
+            "ON CONFLICT(user_id, event_id) DO UPDATE SET status='selected', selected_ts=excluded.selected_ts, paid_clicked_ts=NULL",
+            (user_id, event_id, "selected", now_ts)
+        )
+        await db.commit()
+    return now_ts
+
+async def db_payment_mark_paid(user_id: int, event_id: int):
+    now_ts = int(datetime.now(tz=MSK).timestamp())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO pending_payments(user_id, event_id, status, selected_ts, paid_clicked_ts) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(user_id, event_id) DO UPDATE SET status='paid_clicked', paid_clicked_ts=excluded.paid_clicked_ts",
+            (user_id, event_id, "paid_clicked", now_ts, now_ts)
+        )
+        await db.commit()
+
+async def db_payment_mark_approved(user_id: int, event_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_payments SET status='approved' WHERE user_id=? AND event_id=?",
+            (user_id, event_id)
+        )
+        await db.commit()
+
+async def db_payment_mark_declined(user_id: int, event_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_payments SET status='declined' WHERE user_id=? AND event_id=?",
+            (user_id, event_id)
+        )
+        await db.commit()
+
+async def db_payment_mark_cancelled(user_id: int, event_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_payments SET status='cancelled' WHERE user_id=? AND event_id=?",
+            (user_id, event_id)
+        )
+        await db.commit()
+
 async def admin_send_user_log(bot: Bot, user_id: int, text: str):
     msg = await bot.send_message(ADMIN_CHAT_ID, text)
     await db_add_admin_map(msg.message_id, user_id)
@@ -402,8 +469,10 @@ async def build_schedule_kb():
     events = await db_list_events_future()
     kb = InlineKeyboardBuilder()
     for event_id, start_ts, title, capacity, remaining, link in events:
-        left_text = "МЕСТ НЕТ" if remaining <= 0 else f"мест: {remaining}"
-        kb.button(text=f"{fmt_dt(start_ts)} — {title} ({left_text})", callback_data=f"signup:{event_id}")
+        text = f"{fmt_dt(start_ts)} — {title}"
+        if remaining <= 0:
+            text += " (МЕСТ НЕТ)"
+        kb.button(text=text, callback_data=f"signup:{event_id}")
     kb.button(text="Отменить запись", callback_data="user:cancel_menu")
     kb.button(text="Назад", callback_data="menu:back")
     kb.adjust(1)
@@ -428,6 +497,7 @@ async def cancel_signup_flow(bot: Bot, user_id: int, event_id: int, by_admin: bo
         return False, "Пользователь не записан(а) на эту встречу."
     await db_set_signup_cancelled(user_id, event_id)
     await db_event_increment_remaining(event_id)
+    await db_payment_mark_cancelled(user_id, event_id)
     try:
         await bot.send_message(user_id, f"Ваша запись отменена: {fmt_dt(start_ts)} — {title}")
     except:
@@ -458,6 +528,14 @@ async def back_main(c: CallbackQuery, bot: Bot):
     await c.message.edit_text("Выберите то, что вас интересует или задайте вопрос в этом чате!", reply_markup=main_menu_kb())
     await c.answer()
 
+@router.callback_query(F.data == "menu:ask")
+async def menu_ask(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
+    await c.message.answer("Напишите свой вопрос в чат!🫀", reply_markup=back_main_kb())
+    await c.answer()
+
 @router.callback_query(F.data == "menu:schedule")
 async def schedule(c: CallbackQuery, bot: Bot):
     if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
@@ -466,7 +544,13 @@ async def schedule(c: CallbackQuery, bot: Bot):
     await db_user_upsert(c.from_user)
     uname = user_label(c.from_user)
     await admin_send_user_log(bot, c.from_user.id, f"🗓️ {uname} (id={c.from_user.id}) открыл(а) Расписание")
-    await c.message.edit_text("На какую встречу вы бы хотели записаться?", reply_markup=await build_schedule_kb())
+    await c.message.edit_text(
+        "Выберите встречу, на которую хотите записаться 🌷\n\n"
+        "Все встречи проходят по донату от 250 ₽\n"
+        "Сумму вы выбираете сами.\n"
+        "После выбора встречи вы сможете сразу оплатить и закрепить за собой место.",
+        reply_markup=await build_schedule_kb()
+    )
     await c.answer()
 
 @router.callback_query(F.data == "user:cancel_menu")
@@ -491,10 +575,10 @@ async def user_cancel_pick(c: CallbackQuery, bot: Bot):
     ok, msg = await cancel_signup_flow(bot, c.from_user.id, event_id, by_admin=False)
     await c.message.answer(msg, reply_markup=back_main_kb())
     if ok:
-        uname = user_label(c.from_user)
         ev = await db_get_event(event_id)
         if ev:
             _, start_ts, title, *_ = ev
+            uname = user_label(c.from_user)
             await admin_send_user_log(bot, c.from_user.id, f"❗ Отмена пользователем: {uname} (id={c.from_user.id}) отменил(а) #{event_id} {fmt_dt(start_ts)} — {title}")
     await c.answer()
 
@@ -515,26 +599,53 @@ async def signup_request(c: CallbackQuery, bot: Bot):
         await c.message.answer("На эту встречу уже нет мест.", reply_markup=back_main_kb())
         await c.answer()
         return
-    if await db_has_pending_request(c.from_user.id, event_id):
-        await c.message.answer("Ваша заявка уже отправлена. Мы скоро подтвердим.", reply_markup=back_main_kb())
-        await c.message.answer(DONATION_TEXT_HTML, parse_mode="HTML")
-        await c.answer()
-        return
     s = await db_signup_get(c.from_user.id, event_id)
     if s and s[0] == "confirmed":
         await c.message.answer("Вы уже записаны на эту встречу.", reply_markup=cancel_entry_btn_kb())
         await c.answer()
         return
-    await db_create_request(c.from_user.id, event_id)
+
+    pay = await db_payment_get(c.from_user.id, event_id)
+    if not pay or pay[0] in ("declined", "cancelled"):
+        selected_ts = await db_payment_set_selected(c.from_user.id, event_id)
+        await db_add_request_log(c.from_user.id, event_id, "selected")
+        await db_add_job("pay_reminder", c.from_user.id, event_id, selected_ts + 3600)
+        uname = user_label(c.from_user)
+        admin_msg = await bot.send_message(
+            ADMIN_CHAT_ID,
+            f"‼️ ЗАЯВКА: {uname} (id={c.from_user.id}) выбрал(а) встречу #{event_id} {fmt_dt(start_ts)} — {title}",
+            reply_markup=admin_request_kb(event_id, c.from_user.id)
+        )
+        await db_add_admin_map(admin_msg.message_id, c.from_user.id)
+
+    await c.message.answer(payment_text_html(start_ts, title), parse_mode="HTML", reply_markup=payment_kb(event_id, include_reason=True))
+    await c.answer()
+
+@router.callback_query(F.data.startswith("paydone:"))
+async def pay_done(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+        await c.answer()
+        return
+    event_id = int(c.data.split(":")[1])
+    ev = await db_get_event(event_id)
+    if not ev:
+        await c.message.answer("Эта встреча уже недоступна.", reply_markup=back_main_kb())
+        await c.answer()
+        return
+    _, start_ts, title, capacity, remaining, link = ev
+    pay = await db_payment_get(c.from_user.id, event_id)
+    if not pay:
+        await db_payment_set_selected(c.from_user.id, event_id)
+    await db_payment_mark_paid(c.from_user.id, event_id)
+    await db_add_request_log(c.from_user.id, event_id, "paid_clicked")
     uname = user_label(c.from_user)
     admin_msg = await bot.send_message(
         ADMIN_CHAT_ID,
-        f"‼️ ЗАЯВКА: {uname} (id={c.from_user.id}) хочет записаться на #{event_id} {fmt_dt(start_ts)} — {title}",
+        f"💳 ОПЛАТА: {uname} (id={c.from_user.id}) нажал(а) «Я оплатила» для встречи #{event_id} {fmt_dt(start_ts)} — {title}",
         reply_markup=admin_request_kb(event_id, c.from_user.id)
     )
     await db_add_admin_map(admin_msg.message_id, c.from_user.id)
-    await c.message.answer("Заявка отправлена! Мы подтвердим и напишем вам здесь.", reply_markup=back_main_kb())
-    await c.message.answer(DONATION_TEXT_HTML, parse_mode="HTML")
+    await c.message.answer("Спасибо! Мы увидим сообщение и подтвердим вашу запись после проверки оплаты.", reply_markup=back_main_kb())
     await c.answer()
 
 @router.callback_query(F.data.startswith("admin:approve:"))
@@ -558,11 +669,9 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
         await c.answer()
         return
 
-    req_id = await db_find_pending_request(user_id, event_id)
-    if req_id:
-        await db_mark_request(req_id, "approved")
-
+    await db_add_request_log(user_id, event_id, "approved")
     await db_signup_confirm(user_id, event_id)
+    await db_payment_mark_approved(user_id, event_id)
 
     _, start_ts, title, capacity, remaining, link = ev
     await c.message.edit_text(f"✅ Подтверждено: пользователь записан на #{event_id} {fmt_dt(start_ts)} — {title}")
@@ -570,7 +679,13 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
     try:
         await bot.send_message(
             user_id,
-            f"✅ Запись подтверждена! Спасибо за вашу поддержку 💛\nВы записаны на встречу: {fmt_dt(start_ts)} — {title}",
+            f"Ваша запись подтверждена 🎉\n\n"
+            f"Вы записаны на:\n\n"
+            f"<b>{fmt_dt(start_ts)} — {title}</b>\n"
+            f"🕕 {datetime.fromtimestamp(start_ts, tz=MSK).strftime('%H:%M')}\n\n"
+            "Ссылку на встречу мы пришлём вам за час в этот чат 🫀\n"
+            "Спасибо за вашу поддержку и доверие!",
+            parse_mode="HTML",
             reply_markup=cancel_entry_btn_kb()
         )
     except:
@@ -580,15 +695,9 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
     confirm_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=24)).timestamp())
     reminder_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=1)).timestamp())
 
-    if confirm_ts <= now_ts:
-        await db_add_job("confirm", user_id, event_id, now_ts)
-    else:
-        await db_add_job("confirm", user_id, event_id, confirm_ts)
-
-    if reminder_ts <= now_ts:
-        await db_add_job("reminder", user_id, event_id, now_ts)
-    else:
-        await db_add_job("reminder", user_id, event_id, reminder_ts)
+    await db_add_job("confirm", user_id, event_id, now_ts if confirm_ts <= now_ts else confirm_ts)
+    await db_add_job("reminder", user_id, event_id, now_ts if reminder_ts <= now_ts else reminder_ts)
+    await db_add_job("start_notice", user_id, event_id, start_ts if start_ts > now_ts else now_ts)
 
     await c.answer()
 
@@ -601,22 +710,17 @@ async def admin_decline(c: CallbackQuery, bot: Bot):
     event_id = int(event_id_s)
     user_id = int(user_id_s)
     ev = await db_get_event(event_id)
-    req_id = await db_find_pending_request(user_id, event_id)
-    if req_id:
-        await db_mark_request(req_id, "declined")
+    await db_add_request_log(user_id, event_id, "declined")
+    await db_payment_mark_declined(user_id, event_id)
     if ev:
         _, start_ts, title, *_ = ev
         await c.message.edit_text(f"❌ Отклонено: заявка на #{event_id} {fmt_dt(start_ts)} — {title}")
         try:
-            await bot.send_message(user_id, f"К сожалению, вашу заявку на {fmt_dt(start_ts)} — {title} мы не подтвердили.")
+            await bot.send_message(user_id, f"К сожалению, вашу запись на {fmt_dt(start_ts)} — {title} мы не подтвердили.")
         except:
             pass
     else:
         await c.message.edit_text("❌ Отклонено: встреча уже недоступна.")
-        try:
-            await bot.send_message(user_id, "К сожалению, вашу заявку мы не подтвердили.")
-        except:
-            pass
     await c.answer()
 
 @router.callback_query(F.data.startswith("confirm:"))
@@ -643,6 +747,7 @@ async def user_confirm(c: CallbackQuery, bot: Bot):
         await db_set_confirm_status(c.from_user.id, event_id, "no")
         await db_set_signup_cancelled(c.from_user.id, event_id)
         await db_event_increment_remaining(event_id)
+        await db_payment_mark_cancelled(c.from_user.id, event_id)
         await c.message.edit_text("Жаль, что вы не сможете к нам прийти.")
         uname = user_label(c.from_user)
         await admin_send_user_log(bot, c.from_user.id, f"❗ Отмена: {uname} (id={c.from_user.id}) отказался(лась) от #{event_id} {fmt_dt(start_ts)} — {title}")
@@ -673,15 +778,17 @@ async def admin_to(m: Message, bot: Bot):
 async def admin_events(m: Message, bot: Bot):
     if not is_admin(m.chat.id):
         return
-    rows = await db_list_events_future()
+    rows = await db_list_events_recent_for_admin()
     if not rows:
         await m.answer("Расписание пустое.")
         return
     lines = []
+    now_ts = int(datetime.now(tz=MSK).timestamp())
     for event_id, start_ts, title, capacity, remaining, link in rows:
+        status = "прошла" if start_ts <= now_ts else "активна"
         left_text = "МЕСТ НЕТ" if remaining <= 0 else f"{remaining}/{capacity}"
         link_txt = "link✅" if (link or "").strip() else "link—"
-        lines.append(f"#{event_id} {fmt_dt(start_ts)} — {title} ({left_text}, {link_txt})")
+        lines.append(f"#{event_id} {fmt_dt(start_ts)} — {title} ({left_text}, {link_txt}, {status})")
     await m.answer("\n".join(lines))
 
 @router.message(Command("add_event"))
@@ -752,7 +859,7 @@ async def admin_set_link(m: Message, bot: Bot):
             try:
                 if await db_is_blocked(uid):
                     continue
-                await bot.send_message(uid, f"Место проведения встречи {fmt_dt(start_ts)} — {title}:\n{link}")
+                await bot.send_message(uid, f"Ссылка на встречу {fmt_dt(start_ts)} — {title}:\n{link}")
                 sent += 1
             except:
                 pass
@@ -762,7 +869,7 @@ async def admin_set_link(m: Message, bot: Bot):
 async def admin_stats(m: Message, bot: Bot):
     if not is_admin(m.chat.id):
         return
-    rows = await db_list_events_future()
+    rows = await db_list_events_recent_for_admin()
     if not rows:
         await m.answer("Расписание пустое.")
         return
@@ -877,6 +984,37 @@ async def admin_broadcast_event(m: Message, bot: Bot):
             pass
     await m.answer(f"Отправлено записанным: {sent}/{len(user_ids)}")
 
+@router.message(Command("thanks_event"))
+async def admin_thanks_event(m: Message, bot: Bot):
+    if not is_admin(m.chat.id):
+        return
+    parts = (m.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await m.answer("Формат: /thanks_event <event_id> <ссылка_на_пост>")
+        return
+    event_id = int(parts[1])
+    post_link = parts[2].strip()
+    ev = await db_get_event(event_id)
+    if not ev:
+        await m.answer("Встреча не найдена.")
+        return
+    _, start_ts, title, *_ = ev
+    text = (
+        f"Спасибо, что были с нами на встрече {fmt_dt(start_ts)} — {title} 💛\n\n"
+        f"Будем очень рады, если вы оставите отзыв в новом посте:\n{post_link}"
+    )
+    user_ids = await db_event_confirmed_user_ids(event_id)
+    sent = 0
+    for uid in user_ids:
+        try:
+            if await db_is_blocked(uid):
+                continue
+            await bot.send_message(uid, text)
+            sent += 1
+        except:
+            pass
+    await m.answer(f"Спасибо-рассылка отправлена: {sent}/{len(user_ids)}")
+
 @router.message(Command("cancel_signup"))
 async def admin_cancel_signup(m: Message, bot: Bot):
     if not is_admin(m.chat.id):
@@ -974,35 +1112,66 @@ async def any_message(m: Message, bot: Bot):
 async def scheduler_loop(bot: Bot):
     while True:
         try:
-            await db_cleanup_expired_events()
+            await db_cleanup_old_events()
             now_ts = int(datetime.now(tz=MSK).timestamp())
-            jobs = await db_next_jobs(now_ts, limit=50)
+            jobs = await db_next_jobs(now_ts, limit=100)
             for job_id, job_type, user_id, event_id, run_ts in jobs:
+                if await db_is_blocked(user_id):
+                    await db_mark_job_sent(job_id)
+                    continue
+
                 ev = await db_get_event(event_id)
+
+                if job_type == "pay_reminder":
+                    if not ev:
+                        await db_mark_job_sent(job_id)
+                        continue
+                    pay = await db_payment_get(user_id, event_id)
+                    if not pay or pay[0] != "selected":
+                        await db_mark_job_sent(job_id)
+                        continue
+                    _, start_ts, title, capacity, remaining, link = ev
+                    if start_ts <= now_ts:
+                        await db_mark_job_sent(job_id)
+                        continue
+                    await bot.send_message(
+                        user_id,
+                        "Видим, что вы выбрали встречу, но ещё не закрепили место 🫀\nЕсли вы всё ещё хотите прийти, вот ссылка на оплату:",
+                        reply_markup=payment_kb(event_id, include_reason=False)
+                    )
+                    await db_mark_job_sent(job_id)
+                    continue
+
                 s = await db_signup_get(user_id, event_id)
                 if not ev or not s or s[0] != "confirmed":
                     await db_mark_job_sent(job_id)
                     continue
-                if await db_is_blocked(user_id):
-                    await db_mark_job_sent(job_id)
-                    continue
+
                 _, start_ts, title, capacity, remaining, link = ev
-                if start_ts <= now_ts:
-                    await db_mark_job_sent(job_id)
-                    continue
 
                 if job_type == "confirm":
+                    if start_ts <= now_ts:
+                        await db_mark_job_sent(job_id)
+                        continue
                     await bot.send_message(
                         user_id,
                         f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
                         reply_markup=confirm_kb(event_id)
                     )
                 elif job_type == "reminder":
-                    link_txt = (link or "").strip()
-                    if link_txt:
-                        await bot.send_message(user_id, f"Встреча скоро начнется: {fmt_dt(start_ts)} — {title}\nМесто проведения: {link_txt}")
+                    if start_ts <= now_ts:
+                        await db_mark_job_sent(job_id)
+                        continue
+                    if link.strip():
+                        await bot.send_message(user_id, f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: {link}")
                     else:
-                        await bot.send_message(user_id, f"Встреча скоро начнется: {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)")
+                        await bot.send_message(user_id, f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)")
+                elif job_type == "start_notice":
+                    text = "Встреча началась, ждём вас!"
+                    if link.strip():
+                        text += f"\n{link}"
+                    await bot.send_message(user_id, text)
+
                 await db_mark_job_sent(job_id)
         except:
             pass
