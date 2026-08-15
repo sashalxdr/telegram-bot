@@ -174,9 +174,9 @@ async def db_init():
                 PRIMARY KEY(user_id, event_id)
             );
         """)
-        # Сбрасываем старые зависшие задачи, чтобы очередь ожила
+        # Полная очистка старых застрявших задач, накопившихся за всё время
         now_ts = int(datetime.now(tz=MSK).timestamp())
-        await db.execute("UPDATE jobs SET sent=1 WHERE run_ts < ? AND sent=0", (now_ts - 86400,))
+        await db.execute("UPDATE jobs SET sent=1 WHERE run_ts < ? AND sent=0", (now_ts,))
         await db.commit()
 
 async def db_is_blocked(user_id: int) -> bool:
@@ -365,7 +365,7 @@ async def db_add_job(job_type: str, user_id: int, event_id: int, run_ts: int):
         )
         await db.commit()
 
-async def db_next_jobs(now_ts: int, limit: int = 50):
+async def db_next_jobs(now_ts: int, limit: int = 100):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT job_id, job_type, user_id, event_id, run_ts FROM jobs WHERE sent=0 AND run_ts<=? ORDER BY run_ts ASC LIMIT ?",
@@ -982,7 +982,7 @@ async def admin_broadcast_event(m: Message, bot: Bot):
         return
     parts = (m.text or "").split(maxsplit=2)
     if len(parts) < 3 or not parts[1].isdigit():
-        await m.answer("Формат: /broadcast_event <event_id> <текст>")
+        await m.answer("Формат: /broadcast_event <event_id> <текст>\nПример: /broadcast_event 1 Девочки, напоминаем про встречу!")
         return
     event_id = int(parts[1])
     msg = parts[2]
