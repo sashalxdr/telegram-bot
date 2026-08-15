@@ -11,7 +11,6 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.session.aiohttp import AiohttpSession
 
-# Настройка логирования в консоль сервера
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -29,12 +28,10 @@ PROXY_URL = (
     or os.getenv("HTTPS_PROXY")
     or os.getenv("https_proxy")
     or os.getenv("HTTP_PROXY")
-    or os.getenv("HTTP_PROXY")
+    or os.getenv("http_proxy")
 )
 
 router = Router()
-
-# Переменная для проверки работы таймера
 scheduler_last_beat = 0
 
 def is_admin(chat_id: int) -> bool:
@@ -291,11 +288,12 @@ async def db_set_link(event_id: int, link: str):
         await db.execute("UPDATE events SET link=? WHERE event_id=?", (link, event_id))
         await db.commit()
 
+# ИСПРАВЛЕНО: INSERT OR IGNORE предотвращает сбои на дубликатах логов
 async def db_add_request_log(user_id: int, event_id: int, status: str):
     now_ts = int(datetime.now(tz=MSK).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO requests(user_id, event_id, status, created_ts) VALUES(?,?,?,?)",
+            "INSERT OR IGNORE INTO requests(user_id, event_id, status, created_ts) VALUES(?,?,?,?)",
             (user_id, event_id, status, now_ts)
         )
         await db.commit()
@@ -372,7 +370,7 @@ async def db_add_job(job_type: str, user_id: int, event_id: int, run_ts: int):
             (job_type, user_id, event_id, run_ts)
         )
         await db.commit()
-    logger.info(f"➕ Добавлена задача {job_type} для user_id={user_id} на {fmt_dt(run_ts)}")
+    logger.info(f"Добавлена задача {job_type} для uid={user_id} на время {fmt_dt(run_ts)}")
 
 async def db_next_jobs(now_ts: int, limit: int = 100):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -719,7 +717,6 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
     confirm_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=24)).timestamp())
     reminder_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=1)).timestamp())
 
-    # Планируем задачи
     await db_add_job("confirm", user_id, event_id, now_ts if confirm_ts <= now_ts else confirm_ts)
     await db_add_job("reminder", user_id, event_id, now_ts if reminder_ts <= now_ts else reminder_ts)
     await db_add_job("start_notice", user_id, event_id, start_ts if start_ts > now_ts else now_ts)
@@ -778,7 +775,6 @@ async def user_confirm(c: CallbackQuery, bot: Bot):
         await admin_send_user_log(bot, c.from_user.id, f"❗ Отмена: {uname} (id={c.from_user.id}) отказался(лась) от #{event_id} {fmt_dt(start_ts)} — {title}")
     await c.answer()
 
-# Диагностическая команда для проверки сервера и базы
 @router.message(Command("diag"))
 async def admin_diag(m: Message, bot: Bot):
     if not is_admin(m.chat.id):
@@ -786,35 +782,32 @@ async def admin_diag(m: Message, bot: Bot):
 
     now_ts = int(datetime.now(tz=MSK).timestamp())
     now_msk = datetime.now(tz=MSK).strftime("%d.%m.%Y %H:%M:%S")
-    now_utc = datetime.utcnow().strftime("%d.%m.%Y %H:%M:%S")
 
     last_beat_sec = (now_ts - scheduler_last_beat) if scheduler_last_beat > 0 else -1
     scheduler_status = f"✅ Работает (тик {last_beat_sec} сек назад)" if 0 <= last_beat_sec < 60 else f"❌ НЕ РАБОТАЕТ ({last_beat_sec} сек)"
 
-    # Читаем задачи
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_jobs = await db.execute("SELECT job_id, job_type, user_id, event_id, run_ts, sent FROM jobs ORDER BY job_id DESC LIMIT 10")
+        cur_jobs = await db.execute("SELECT job_id, job_type, user_id, event_id, run_ts, sent FROM jobs ORDER BY job_id DESC LIMIT 6")
         jobs = await cur_jobs.fetchall()
 
-        cur_signups = await db.execute("SELECT user_id, event_id, status, confirm_status FROM signups ORDER BY event_id DESC LIMIT 10")
+        cur_signups = await db.execute("SELECT user_id, event_id, status, confirm_status FROM signups ORDER BY event_id DESC LIMIT 6")
         signups = await cur_signups.fetchall()
 
     jobs_txt = []
     for j_id, j_type, u_id, e_id, r_ts, sent in jobs:
         st = "✅ отправлено" if sent == 1 else ("⏳ ждет" if r_ts > now_ts else "🔥 ДОЛЖНО УЙТИ")
-        jobs_txt.append(f"#{j_id} [{j_type}] для uid={u_id} на {fmt_dt(r_ts)} ({st})")
+        jobs_txt.append(f"#{j_id} [{j_type}] uid={u_id} на {fmt_dt(r_ts)} ({st})")
 
     signups_txt = []
     for u_id, e_id, status, c_status in signups:
-        signups_txt.append(f"uid={u_id} на ивент #{e_id}: статус={status}, conf={c_status}")
+        signups_txt.append(f"uid={u_id} ивент #{e_id}: статус={status}, conf={c_status}")
 
     res = (
-        f"<b>🩺 ДИАГНОСТИКА СИСТЕМЫ:</b>\n\n"
-        f"<b>Таймер (scheduler):</b> {scheduler_status}\n"
-        f"<b>Время МСК:</b> {now_msk}\n"
-        f"<b>Время UTC:</b> {now_utc}\n\n"
-        f"<b>📋 Последние записи (signups):</b>\n" + ("\n".join(signups_txt) if signups_txt else "пусто") + "\n\n"
-        f"<b>⚙️ Последние задачи (jobs):</b>\n" + ("\n".join(jobs_txt) if jobs_txt else "пусто")
+        f"<b>🩺 ДИАГНОСТИКА:</b>\n"
+        f"<b>Планировщик:</b> {scheduler_status}\n"
+        f"<b>Время МСК:</b> {now_msk}\n\n"
+        f"<b>📋 Записи:</b>\n" + ("\n".join(signups_txt) if signups_txt else "пусто") + "\n\n"
+        f"<b>⚙️ Задачи рассылки:</b>\n" + ("\n".join(jobs_txt) if jobs_txt else "пусто")
     )
     await m.answer(res, parse_mode="HTML")
 
@@ -1186,9 +1179,6 @@ async def scheduler_loop(bot: Bot):
             await db_cleanup_old_events()
             now_ts = int(datetime.now(tz=MSK).timestamp())
             jobs = await db_next_jobs(now_ts, limit=100)
-            
-            if jobs:
-                logger.info(f"Найдено задач для обработки: {len(jobs)}")
 
             for job_id, job_type, user_id, event_id, run_ts in jobs:
                 try:
@@ -1216,7 +1206,6 @@ async def scheduler_loop(bot: Bot):
 
                     s = await db_signup_get(user_id, event_id)
                     if not s or s[0] != "confirmed":
-                        logger.warning(f"Задача {job_id} пропущена: пользователь uid={user_id} не в статусе confirmed (статус={s})")
                         continue
 
                     if job_type == "confirm":
@@ -1228,9 +1217,7 @@ async def scheduler_loop(bot: Bot):
                                 f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
                                 reply_markup=confirm_kb(event_id)
                             )
-                            logger.info(f"✅ Подтверждение отправлено user_id={user_id} на ивент #{event_id}")
                         except Exception as e:
-                            logger.error(f"❌ Ошибка отправки confirm для user_id={user_id}: {e}")
                             uname = await db_get_user_display_name(user_id)
                             await bot.send_message(
                                 ADMIN_CHAT_ID,
@@ -1247,9 +1234,7 @@ async def scheduler_loop(bot: Bot):
                         )
                         try:
                             await bot.send_message(user_id, msg_text)
-                            logger.info(f"✅ Напоминание со ссылкой отправлено user_id={user_id}")
                         except Exception as e:
-                            logger.error(f"❌ Ошибка отправки reminder для user_id={user_id}: {e}")
                             uname = await db_get_user_display_name(user_id)
                             await bot.send_message(
                                 ADMIN_CHAT_ID,
@@ -1269,7 +1254,7 @@ async def scheduler_loop(bot: Bot):
                     logger.error(f"Ошибка при обработке job_id={job_id}: {inner_e}")
                 finally:
                     await db_mark_job_sent(job_id)
-                    
+
         except Exception as outer_e:
             logger.error(f"Критическая ошибка в scheduler_loop: {outer_e}")
         await asyncio.sleep(20)
