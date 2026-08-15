@@ -186,6 +186,8 @@ async def db_init():
                 PRIMARY KEY(user_id, event_id)
             );
         """)
+        # Сброс старых зависших задач, чтобы очередь сразу заработала
+        await db.execute("UPDATE jobs SET sent=1 WHERE sent=0")
         await db.commit()
 
 async def db_is_blocked(user_id: int) -> bool:
@@ -373,7 +375,6 @@ async def db_add_job(job_type: str, user_id: int, event_id: int, run_ts: int):
             (job_type, user_id, event_id, run_ts)
         )
         await db.commit()
-    logger.info(f"Добавлена задача {job_type} для uid={user_id} на время {fmt_dt(run_ts)}")
 
 async def db_next_jobs(now_ts: int, limit: int = 100):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -654,7 +655,7 @@ async def pay_done(c: CallbackQuery, bot: Bot):
     event_id = int(c.data.split(":")[1])
     ev = await db_get_event(event_id)
     if not ev:
-        await c.message.answer("Эта встреча уже недоступна.", reply_markup=back_main_kb())
+        await c.message.edit_text("Эта встреча уже недоступна.")
         await c.answer()
         return
     _, start_ts, title, capacity, remaining, link = ev
@@ -713,17 +714,31 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
             parse_mode="HTML",
             reply_markup=cancel_entry_btn_kb()
         )
-        logger.info(f"Сообщение о подтверждении успешно доставлено user_id={user_id}")
     except Exception as e:
-        logger.error(f"Не удалось отправить подтверждение в ЛС user_id={user_id}: {e}")
+        logger.error(f"Не удалось отправить приветствие в ЛС user_id={user_id}: {e}")
 
     now_ts = int(datetime.now(tz=MSK).timestamp())
     confirm_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=24)).timestamp())
     reminder_ts = int((datetime.fromtimestamp(start_ts, tz=MSK) - timedelta(hours=1)).timestamp())
 
-    await db_add_job("confirm", user_id, event_id, now_ts if confirm_ts <= now_ts else confirm_ts)
-    await db_add_job("reminder", user_id, event_id, now_ts if reminder_ts <= now_ts else reminder_ts)
-    await db_add_job("start_notice", user_id, event_id, start_ts if start_ts > now_ts else now_ts)
+    # Если до встречи уже меньше 24 часов — сразу отправляем опрос с кнопками
+    if confirm_ts <= now_ts < start_ts:
+        try:
+            await bot.send_message(
+                user_id,
+                f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
+                reply_markup=confirm_kb(event_id)
+            )
+            logger.info(f"Мгновенный опрос отправлен user_id={user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка мгновенной отправки confirm: {e}")
+    elif confirm_ts > now_ts:
+        await db_add_job("confirm", user_id, event_id, confirm_ts)
+
+    if reminder_ts > now_ts:
+        await db_add_job("reminder", user_id, event_id, reminder_ts)
+    if start_ts > now_ts:
+        await db_add_job("start_notice", user_id, event_id, start_ts)
 
     await c.answer()
 
@@ -779,11 +794,65 @@ async def user_confirm(c: CallbackQuery, bot: Bot):
         await admin_send_user_log(bot, c.from_user.id, f"❗ Отмена: {uname} (id={c.from_user.id}) отказался(лась) от #{event_id} {fmt_dt(start_ts)} — {title}")
     await c.answer()
 
-# ДИАГНОСТИКА: теперь отвечает на команду в любом случае!
+@router.message(Command("send_confirm"))
+async def admin_send_confirm(m: Message, bot: Bot):
+    if not is_admin(m.chat.id, m.from_user.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await m.answer("Формат: /send_confirm <ID_встречи>")
+        return
+    event_id = int(parts[1])
+    ev = await db_get_event(event_id)
+    if not ev:
+        await m.answer("Встреча не найдена.")
+        return
+    _, start_ts, title, *_ = ev
+    user_ids = await db_event_confirmed_user_ids(event_id)
+    sent = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(
+                uid,
+                f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
+                reply_markup=confirm_kb(event_id)
+            )
+            sent += 1
+        except Exception:
+            pass
+    await m.answer(f"Опрос отправлен: {sent}/{len(user_ids)} участницам встречи #{event_id}")
+
+@router.message(Command("send_reminder"))
+async def admin_send_reminder(m: Message, bot: Bot):
+    if not is_admin(m.chat.id, m.from_user.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await m.answer("Формат: /send_reminder <ID_встречи>")
+        return
+    event_id = int(parts[1])
+    ev = await db_get_event(event_id)
+    if not ev:
+        await m.answer("Встреча не найдена.")
+        return
+    _, start_ts, title, _, _, link = ev
+    user_ids = await db_event_confirmed_user_ids(event_id)
+    msg_text = (
+        f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: {link}"
+        if link and link.strip()
+        else f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)"
+    )
+    sent = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, msg_text)
+            sent += 1
+        except Exception:
+            pass
+    await m.answer(f"Напоминание со ссылкой отправлено: {sent}/{len(user_ids)} участницам встречи #{event_id}")
+
 @router.message(Command("diag"))
 async def admin_diag(m: Message, bot: Bot):
-    user_is_adm = is_admin(m.chat.id, m.from_user.id)
-
     now_ts = int(datetime.now(tz=MSK).timestamp())
     now_msk = datetime.now(tz=MSK).strftime("%d.%m.%Y %H:%M:%S")
 
@@ -807,15 +876,12 @@ async def admin_diag(m: Message, bot: Bot):
         signups_txt.append(f"uid={u_id} ивент #{e_id}: статус={status}, conf={c_status}")
 
     res = (
-        f"<b>🩺 ДИАГНОСТИКА СИСТЕМЫ:</b>\n\n"
-        f"• Ваш Chat ID: <code>{m.chat.id}</code>\n"
-        f"• Ваш User ID: <code>{m.from_user.id}</code>\n"
-        f"• Настроенный ADMIN_CHAT_ID: <code>{ADMIN_CHAT_ID}</code>\n"
-        f"• Вы распознаны как админ: <b>{'ДА ✅' if user_is_adm else 'НЕТ ❌'}</b>\n\n"
+        f"<b>🩺 ДИАГНОСТИКА:</b>\n"
+        f"• Ваш ID: <code>{m.from_user.id}</code> (Админ: {'ДА' if is_admin(m.chat.id, m.from_user.id) else 'НЕТ'})\n"
         f"• Планировщик: {scheduler_status}\n"
         f"• Время МСК: {now_msk}\n\n"
-        f"<b>📋 Последние записи:</b>\n" + ("\n".join(signups_txt) if signups_txt else "пусто") + "\n\n"
-        f"<b>⚙️ Последние задачи:</b>\n" + ("\n".join(jobs_txt) if jobs_txt else "пусто")
+        f"<b>📋 Записи:</b>\n" + ("\n".join(signups_txt) if signups_txt else "пусто") + "\n\n"
+        f"<b>⚙️ Задачи рассылки:</b>\n" + ("\n".join(jobs_txt) if jobs_txt else "пусто")
     )
     await m.answer(res, parse_mode="HTML")
 
@@ -1180,7 +1246,6 @@ async def any_message(m: Message, bot: Bot):
 
 async def scheduler_loop(bot: Bot):
     global scheduler_last_beat
-    logger.info("🚀 Фоновый планировщик (scheduler_loop) запущен")
     while True:
         try:
             scheduler_last_beat = int(datetime.now(tz=MSK).timestamp())
@@ -1225,7 +1290,6 @@ async def scheduler_loop(bot: Bot):
                                 f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
                                 reply_markup=confirm_kb(event_id)
                             )
-                            logger.info(f"✅ Подтверждение отправлено user_id={user_id} на ивент #{event_id}")
                         except Exception as e:
                             uname = await db_get_user_display_name(user_id)
                             await bot.send_message(
@@ -1243,7 +1307,6 @@ async def scheduler_loop(bot: Bot):
                         )
                         try:
                             await bot.send_message(user_id, msg_text)
-                            logger.info(f"✅ Напоминание со ссылкой отправлено user_id={user_id}")
                         except Exception as e:
                             uname = await db_get_user_display_name(user_id)
                             await bot.send_message(
