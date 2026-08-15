@@ -34,8 +34,12 @@ PROXY_URL = (
 router = Router()
 scheduler_last_beat = 0
 
-def is_admin(chat_id: int) -> bool:
-    return chat_id == ADMIN_CHAT_ID
+def is_admin(chat_id: int, user_id: int | None = None) -> bool:
+    if chat_id == ADMIN_CHAT_ID:
+        return True
+    if user_id and user_id == ADMIN_CHAT_ID:
+        return True
+    return False
 
 def user_label(u) -> str:
     if u.username:
@@ -288,7 +292,6 @@ async def db_set_link(event_id: int, link: str):
         await db.execute("UPDATE events SET link=? WHERE event_id=?", (link, event_id))
         await db.commit()
 
-# ИСПРАВЛЕНО: INSERT OR IGNORE предотвращает сбои на дубликатах логов
 async def db_add_request_log(user_id: int, event_id: int, status: str):
     now_ts = int(datetime.now(tz=MSK).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
@@ -530,7 +533,7 @@ async def cancel_signup_flow(bot: Bot, user_id: int, event_id: int, by_admin: bo
 
 @router.message(CommandStart())
 async def start(m: Message, bot: Bot):
-    if not is_admin(m.chat.id) and await db_is_blocked(m.from_user.id):
+    if not is_admin(m.chat.id, m.from_user.id) and await db_is_blocked(m.from_user.id):
         return
     await db_user_upsert(m.from_user)
     uname = user_label(m.from_user)
@@ -544,7 +547,7 @@ async def start(m: Message, bot: Bot):
 
 @router.callback_query(F.data == "menu:back")
 async def back_main(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     await c.message.edit_text("Выберите то, что вас интересует или задайте вопрос в этом чате!", reply_markup=main_menu_kb())
@@ -552,7 +555,7 @@ async def back_main(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "menu:ask")
 async def menu_ask(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     await c.message.answer("Напишите свой вопрос в чат!🫀", reply_markup=back_main_kb())
@@ -560,7 +563,7 @@ async def menu_ask(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "menu:schedule")
 async def schedule(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     await db_user_upsert(c.from_user)
@@ -577,7 +580,7 @@ async def schedule(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "user:cancel_menu")
 async def user_cancel_menu(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     kb, rows = await build_user_cancel_kb(c.from_user.id)
@@ -590,7 +593,7 @@ async def user_cancel_menu(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("user:cancel:"))
 async def user_cancel_pick(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     event_id = int(c.data.split(":")[2])
@@ -606,7 +609,7 @@ async def user_cancel_pick(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("signup:"))
 async def signup_request(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     await db_user_upsert(c.from_user)
@@ -645,7 +648,7 @@ async def signup_request(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("paydone:"))
 async def pay_done(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     event_id = int(c.data.split(":")[1])
@@ -672,8 +675,8 @@ async def pay_done(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("admin:approve:"))
 async def admin_approve(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id):
-        await c.answer()
+    if not is_admin(c.message.chat.id, c.from_user.id):
+        await c.answer("У вас нет прав администратора.")
         return
     _, _, event_id_s, user_id_s = c.data.split(":")
     event_id = int(event_id_s)
@@ -710,6 +713,7 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
             parse_mode="HTML",
             reply_markup=cancel_entry_btn_kb()
         )
+        logger.info(f"Сообщение о подтверждении успешно доставлено user_id={user_id}")
     except Exception as e:
         logger.error(f"Не удалось отправить подтверждение в ЛС user_id={user_id}: {e}")
 
@@ -725,8 +729,8 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("admin:decline:"))
 async def admin_decline(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id):
-        await c.answer()
+    if not is_admin(c.message.chat.id, c.from_user.id):
+        await c.answer("У вас нет прав администратора.")
         return
     _, _, event_id_s, user_id_s = c.data.split(":")
     event_id = int(event_id_s)
@@ -747,7 +751,7 @@ async def admin_decline(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("confirm:"))
 async def user_confirm(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id) and await db_is_blocked(c.from_user.id):
+    if not is_admin(c.message.chat.id, c.from_user.id) and await db_is_blocked(c.from_user.id):
         await c.answer()
         return
     _, event_id_s, ans = c.data.split(":")
@@ -775,22 +779,22 @@ async def user_confirm(c: CallbackQuery, bot: Bot):
         await admin_send_user_log(bot, c.from_user.id, f"❗ Отмена: {uname} (id={c.from_user.id}) отказался(лась) от #{event_id} {fmt_dt(start_ts)} — {title}")
     await c.answer()
 
+# ДИАГНОСТИКА: теперь отвечает на команду в любом случае!
 @router.message(Command("diag"))
 async def admin_diag(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
-        return
+    user_is_adm = is_admin(m.chat.id, m.from_user.id)
 
     now_ts = int(datetime.now(tz=MSK).timestamp())
     now_msk = datetime.now(tz=MSK).strftime("%d.%m.%Y %H:%M:%S")
 
     last_beat_sec = (now_ts - scheduler_last_beat) if scheduler_last_beat > 0 else -1
-    scheduler_status = f"✅ Работает (тик {last_beat_sec} сек назад)" if 0 <= last_beat_sec < 60 else f"❌ НЕ РАБОТАЕТ ({last_beat_sec} сек)"
+    scheduler_status = f"✅ Работает ({last_beat_sec} сек назад)" if 0 <= last_beat_sec < 60 else f"❌ НЕ РАБОТАЕТ ({last_beat_sec} сек)"
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_jobs = await db.execute("SELECT job_id, job_type, user_id, event_id, run_ts, sent FROM jobs ORDER BY job_id DESC LIMIT 6")
+        cur_jobs = await db.execute("SELECT job_id, job_type, user_id, event_id, run_ts, sent FROM jobs ORDER BY job_id DESC LIMIT 5")
         jobs = await cur_jobs.fetchall()
 
-        cur_signups = await db.execute("SELECT user_id, event_id, status, confirm_status FROM signups ORDER BY event_id DESC LIMIT 6")
+        cur_signups = await db.execute("SELECT user_id, event_id, status, confirm_status FROM signups ORDER BY event_id DESC LIMIT 5")
         signups = await cur_signups.fetchall()
 
     jobs_txt = []
@@ -803,11 +807,15 @@ async def admin_diag(m: Message, bot: Bot):
         signups_txt.append(f"uid={u_id} ивент #{e_id}: статус={status}, conf={c_status}")
 
     res = (
-        f"<b>🩺 ДИАГНОСТИКА:</b>\n"
-        f"<b>Планировщик:</b> {scheduler_status}\n"
-        f"<b>Время МСК:</b> {now_msk}\n\n"
-        f"<b>📋 Записи:</b>\n" + ("\n".join(signups_txt) if signups_txt else "пусто") + "\n\n"
-        f"<b>⚙️ Задачи рассылки:</b>\n" + ("\n".join(jobs_txt) if jobs_txt else "пусто")
+        f"<b>🩺 ДИАГНОСТИКА СИСТЕМЫ:</b>\n\n"
+        f"• Ваш Chat ID: <code>{m.chat.id}</code>\n"
+        f"• Ваш User ID: <code>{m.from_user.id}</code>\n"
+        f"• Настроенный ADMIN_CHAT_ID: <code>{ADMIN_CHAT_ID}</code>\n"
+        f"• Вы распознаны как админ: <b>{'ДА ✅' if user_is_adm else 'НЕТ ❌'}</b>\n\n"
+        f"• Планировщик: {scheduler_status}\n"
+        f"• Время МСК: {now_msk}\n\n"
+        f"<b>📋 Последние записи:</b>\n" + ("\n".join(signups_txt) if signups_txt else "пусто") + "\n\n"
+        f"<b>⚙️ Последние задачи:</b>\n" + ("\n".join(jobs_txt) if jobs_txt else "пусто")
     )
     await m.answer(res, parse_mode="HTML")
 
@@ -819,7 +827,7 @@ async def admin_reply(m: Message, bot: Bot):
 
 @router.message(Command("to"))
 async def admin_to(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=2)
     if len(parts) < 3:
@@ -837,7 +845,7 @@ async def admin_to(m: Message, bot: Bot):
 
 @router.message(Command("events"))
 async def admin_events(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     rows = await db_list_events_recent_for_admin()
     if not rows:
@@ -854,7 +862,7 @@ async def admin_events(m: Message, bot: Bot):
 
 @router.message(Command("add_event"))
 async def admin_add_event(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     txt = (m.text or "").strip()
     parts = txt.split(maxsplit=4)
@@ -884,7 +892,7 @@ async def admin_add_event(m: Message, bot: Bot):
 
 @router.message(Command("del_event"))
 async def admin_del_event(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].isdigit():
@@ -896,7 +904,7 @@ async def admin_del_event(m: Message, bot: Bot):
 
 @router.message(Command("set_link"))
 async def admin_set_link(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=2)
     if len(parts) < 3 or not parts[1].isdigit():
@@ -928,7 +936,7 @@ async def admin_set_link(m: Message, bot: Bot):
 
 @router.message(Command("stats"))
 async def admin_stats(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     rows = await db_list_events_recent_for_admin()
     if not rows:
@@ -938,7 +946,7 @@ async def admin_stats(m: Message, bot: Bot):
 
 @router.callback_query(F.data.startswith("stats:"))
 async def admin_stats_pick(c: CallbackQuery, bot: Bot):
-    if not is_admin(c.message.chat.id):
+    if not is_admin(c.message.chat.id, c.from_user.id):
         await c.answer()
         return
     eid = int(c.data.split(":")[1])
@@ -965,7 +973,7 @@ async def admin_stats_pick(c: CallbackQuery, bot: Bot):
 
 @router.message(Command("broadcast_all"))
 async def admin_broadcast_all(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     text = (m.text or "").split(maxsplit=1)
     if len(text) < 2 or not text[1].strip():
@@ -986,7 +994,7 @@ async def admin_broadcast_all(m: Message, bot: Bot):
 
 @router.message(Command("broadcast"))
 async def admin_broadcast(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     txt = (m.text or "").split(maxsplit=2)
     if len(txt) < 3:
@@ -1021,7 +1029,7 @@ async def admin_broadcast(m: Message, bot: Bot):
 
 @router.message(Command("broadcast_event"))
 async def admin_broadcast_event(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=2)
     if len(parts) < 3 or not parts[1].isdigit():
@@ -1050,7 +1058,7 @@ async def admin_broadcast_event(m: Message, bot: Bot):
 
 @router.message(Command("thanks_event"))
 async def admin_thanks_event(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=2)
     if len(parts) < 3 or not parts[1].isdigit():
@@ -1081,7 +1089,7 @@ async def admin_thanks_event(m: Message, bot: Bot):
 
 @router.message(Command("cancel_signup"))
 async def admin_cancel_signup(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=2)
     if len(parts) < 3 or not parts[1].isdigit():
@@ -1108,7 +1116,7 @@ async def admin_cancel_signup(m: Message, bot: Bot):
 
 @router.message(Command("block"))
 async def admin_block(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1134,7 +1142,7 @@ async def admin_block(m: Message, bot: Bot):
 
 @router.message(Command("unblock"))
 async def admin_unblock(m: Message, bot: Bot):
-    if not is_admin(m.chat.id):
+    if not is_admin(m.chat.id, m.from_user.id):
         return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
@@ -1160,7 +1168,7 @@ async def admin_unblock(m: Message, bot: Bot):
 
 @router.message()
 async def any_message(m: Message, bot: Bot):
-    if is_admin(m.chat.id):
+    if is_admin(m.chat.id, m.from_user.id):
         return
     if await db_is_blocked(m.from_user.id):
         return
@@ -1217,6 +1225,7 @@ async def scheduler_loop(bot: Bot):
                                 f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
                                 reply_markup=confirm_kb(event_id)
                             )
+                            logger.info(f"✅ Подтверждение отправлено user_id={user_id} на ивент #{event_id}")
                         except Exception as e:
                             uname = await db_get_user_display_name(user_id)
                             await bot.send_message(
@@ -1234,6 +1243,7 @@ async def scheduler_loop(bot: Bot):
                         )
                         try:
                             await bot.send_message(user_id, msg_text)
+                            logger.info(f"✅ Напоминание со ссылкой отправлено user_id={user_id}")
                         except Exception as e:
                             uname = await db_get_user_display_name(user_id)
                             await bot.send_message(
