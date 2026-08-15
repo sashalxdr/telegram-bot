@@ -174,6 +174,9 @@ async def db_init():
                 PRIMARY KEY(user_id, event_id)
             );
         """)
+        # Сбрасываем старые зависшие задачи, чтобы очередь ожила
+        now_ts = int(datetime.now(tz=MSK).timestamp())
+        await db.execute("UPDATE jobs SET sent=1 WHERE run_ts < ? AND sent=0", (now_ts - 86400,))
         await db.commit()
 
 async def db_is_blocked(user_id: int) -> bool:
@@ -201,6 +204,18 @@ async def db_user_upsert(u):
             (u.id, u.username, u.first_name, u.last_name, now_ts)
         )
         await db.commit()
+
+async def db_get_user_display_name(user_id: int) -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT username, first_name, last_name FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if row:
+            username, fn, ln = row
+            if username:
+                return f"@{username}"
+            name = " ".join([x for x in [fn, ln] if x]).strip()
+            return name if name else f"user_{user_id}"
+        return f"id={user_id}"
 
 async def db_add_admin_map(admin_msg_id: int, user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -399,7 +414,7 @@ async def db_user_confirmed_future_events(user_id: int):
     now_ts = int(datetime.now(tz=MSK).timestamp())
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT e.event_id, e.start_ts, e.title, e.capacity, e.remaining, COALESCE(e.link,'') "
+            "SELECT e.event_id, e.start_ts, e.title, e.capacity, e.remaining, COALESCE(link,'') "
             "FROM signups s JOIN events e ON e.event_id=s.event_id "
             "WHERE s.user_id=? AND s.status='confirmed' AND e.start_ts>? "
             "ORDER BY e.start_ts ASC",
@@ -500,7 +515,7 @@ async def cancel_signup_flow(bot: Bot, user_id: int, event_id: int, by_admin: bo
     await db_payment_mark_cancelled(user_id, event_id)
     try:
         await bot.send_message(user_id, f"Ваша запись отменена: {fmt_dt(start_ts)} — {title}")
-    except:
+    except Exception:
         pass
     if by_admin and admin_chat_id:
         await bot.send_message(admin_chat_id, f"Отменено: пользователь (id={user_id}) — #{event_id} {fmt_dt(start_ts)} — {title}")
@@ -688,7 +703,7 @@ async def admin_approve(c: CallbackQuery, bot: Bot):
             parse_mode="HTML",
             reply_markup=cancel_entry_btn_kb()
         )
-    except:
+    except Exception:
         pass
 
     now_ts = int(datetime.now(tz=MSK).timestamp())
@@ -717,7 +732,7 @@ async def admin_decline(c: CallbackQuery, bot: Bot):
         await c.message.edit_text(f"❌ Отклонено: заявка на #{event_id} {fmt_dt(start_ts)} — {title}")
         try:
             await bot.send_message(user_id, f"К сожалению, вашу запись на {fmt_dt(start_ts)} — {title} мы не подтвердили.")
-        except:
+        except Exception:
             pass
     else:
         await c.message.edit_text("❌ Отклонено: встреча уже недоступна.")
@@ -769,10 +784,13 @@ async def admin_to(m: Message, bot: Bot):
         return
     try:
         uid = int(parts[1])
-    except:
+    except Exception:
         await m.answer("Формат: /to <user_id> <текст>")
         return
-    await bot.send_message(uid, parts[2])
+    try:
+        await bot.send_message(uid, parts[2])
+    except Exception as e:
+        await m.answer(f"Не удалось отправить: {e}")
 
 @router.message(Command("events"))
 async def admin_events(m: Message, bot: Bot):
@@ -805,13 +823,13 @@ async def admin_add_event(m: Message, bot: Bot):
         cap = int(cap_s)
         if cap <= 0:
             raise ValueError
-    except:
+    except Exception:
         await m.answer("Места должны быть числом > 0. Формат: /add_event YYYY-MM-DD HH:MM <места> <название>")
         return
     try:
         dt = datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M").replace(tzinfo=MSK)
         start_ts = int(dt.timestamp())
-    except:
+    except Exception:
         await m.answer("Дата/время неверные. Формат: YYYY-MM-DD HH:MM (по МСК)")
         return
     now_ts = int(datetime.now(tz=MSK).timestamp())
@@ -861,7 +879,7 @@ async def admin_set_link(m: Message, bot: Bot):
                     continue
                 await bot.send_message(uid, f"Ссылка на встречу {fmt_dt(start_ts)} — {title}:\n{link}")
                 sent += 1
-            except:
+            except Exception:
                 pass
         await m.answer(f"Ссылка разослана записанным: {sent}/{len(user_ids)}")
 
@@ -919,7 +937,7 @@ async def admin_broadcast_all(m: Message, bot: Bot):
                 continue
             await bot.send_message(uid, msg)
             sent += 1
-        except:
+        except Exception:
             pass
     await m.answer(f"Рассылка отправлена: {sent}/{len(users)}")
 
@@ -954,7 +972,7 @@ async def admin_broadcast(m: Message, bot: Bot):
                 continue
             await bot.send_message(uid, msg)
             sent += 1
-        except:
+        except Exception:
             pass
     await m.answer(f"Отправлено: {sent}/{len(targets)}")
 
@@ -973,6 +991,9 @@ async def admin_broadcast_event(m: Message, bot: Bot):
         await m.answer("Встреча не найдена.")
         return
     user_ids = await db_event_confirmed_user_ids(event_id)
+    if not user_ids:
+        await m.answer(f"На встречу #{event_id} нет подтвержденных участниц.")
+        return
     sent = 0
     for uid in user_ids:
         try:
@@ -980,7 +1001,7 @@ async def admin_broadcast_event(m: Message, bot: Bot):
                 continue
             await bot.send_message(uid, msg)
             sent += 1
-        except:
+        except Exception:
             pass
     await m.answer(f"Отправлено записанным: {sent}/{len(user_ids)}")
 
@@ -1011,7 +1032,7 @@ async def admin_thanks_event(m: Message, bot: Bot):
                 continue
             await bot.send_message(uid, text)
             sent += 1
-        except:
+        except Exception:
             pass
     await m.answer(f"Спасибо-рассылка отправлена: {sent}/{len(user_ids)}")
 
@@ -1020,10 +1041,7 @@ async def admin_cancel_signup(m: Message, bot: Bot):
     if not is_admin(m.chat.id):
         return
     parts = (m.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await m.answer("Формат: /cancel_signup <event_id> <user_id или @username>")
-        return
-    if not parts[1].isdigit():
+    if len(parts) < 3 or not parts[1].isdigit():
         await m.answer("Формат: /cancel_signup <event_id> <user_id или @username>")
         return
     event_id = int(parts[1])
@@ -1115,65 +1133,83 @@ async def scheduler_loop(bot: Bot):
             await db_cleanup_old_events()
             now_ts = int(datetime.now(tz=MSK).timestamp())
             jobs = await db_next_jobs(now_ts, limit=100)
+            
             for job_id, job_type, user_id, event_id, run_ts in jobs:
-                if await db_is_blocked(user_id):
-                    await db_mark_job_sent(job_id)
-                    continue
+                try:
+                    if await db_is_blocked(user_id):
+                        continue
 
-                ev = await db_get_event(event_id)
-
-                if job_type == "pay_reminder":
+                    ev = await db_get_event(event_id)
                     if not ev:
-                        await db_mark_job_sent(job_id)
                         continue
-                    pay = await db_payment_get(user_id, event_id)
-                    if not pay or pay[0] != "selected":
-                        await db_mark_job_sent(job_id)
-                        continue
+
                     _, start_ts, title, capacity, remaining, link = ev
-                    if start_ts <= now_ts:
-                        await db_mark_job_sent(job_id)
+
+                    if job_type == "pay_reminder":
+                        pay = await db_payment_get(user_id, event_id)
+                        if not pay or pay[0] != "selected":
+                            continue
+                        if start_ts <= now_ts:
+                            continue
+                        await bot.send_message(
+                            user_id,
+                            "Видим, что вы выбрали встречу, но ещё не закрепили место 🫀\nЕсли вы всё ещё хотите прийти, вот ссылка на оплату:",
+                            reply_markup=payment_kb(event_id, include_reason=False)
+                        )
                         continue
-                    await bot.send_message(
-                        user_id,
-                        "Видим, что вы выбрали встречу, но ещё не закрепили место 🫀\nЕсли вы всё ещё хотите прийти, вот ссылка на оплату:",
-                        reply_markup=payment_kb(event_id, include_reason=False)
-                    )
+
+                    s = await db_signup_get(user_id, event_id)
+                    if not s or s[0] != "confirmed":
+                        continue
+
+                    if job_type == "confirm":
+                        if start_ts <= now_ts:
+                            continue
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
+                                reply_markup=confirm_kb(event_id)
+                            )
+                        except Exception as e:
+                            uname = await db_get_user_display_name(user_id)
+                            await bot.send_message(
+                                ADMIN_CHAT_ID,
+                                f"⚠️ Не удалось отправить подтверждение за сутки участнице {uname} (id={user_id}) на встречу #{event_id} {fmt_dt(start_ts)} — {title}\nПричина: {e}"
+                            )
+
+                    elif job_type == "reminder":
+                        if start_ts <= now_ts:
+                            continue
+                        msg_text = (
+                            f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: {link}"
+                            if link and link.strip()
+                            else f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)"
+                        )
+                        try:
+                            await bot.send_message(user_id, msg_text)
+                        except Exception as e:
+                            uname = await db_get_user_display_name(user_id)
+                            await bot.send_message(
+                                ADMIN_CHAT_ID,
+                                f"⚠️ Не удалось отправить ссылку/напоминание за час участнице {uname} (id={user_id}) на встречу #{event_id} {fmt_dt(start_ts)} — {title}\nПричина: {e}"
+                            )
+
+                    elif job_type == "start_notice":
+                        text = "Встреча началась, ждём вас!"
+                        if link and link.strip():
+                            text += f"\n{link}"
+                        try:
+                            await bot.send_message(user_id, text)
+                        except Exception:
+                            pass
+
+                except Exception:
+                    pass
+                finally:
                     await db_mark_job_sent(job_id)
-                    continue
-
-                s = await db_signup_get(user_id, event_id)
-                if not ev or not s or s[0] != "confirmed":
-                    await db_mark_job_sent(job_id)
-                    continue
-
-                _, start_ts, title, capacity, remaining, link = ev
-
-                if job_type == "confirm":
-                    if start_ts <= now_ts:
-                        await db_mark_job_sent(job_id)
-                        continue
-                    await bot.send_message(
-                        user_id,
-                        f"Подтвердите, пожалуйста, что вы придете на встречу: {fmt_dt(start_ts)} — {title}",
-                        reply_markup=confirm_kb(event_id)
-                    )
-                elif job_type == "reminder":
-                    if start_ts <= now_ts:
-                        await db_mark_job_sent(job_id)
-                        continue
-                    if link.strip():
-                        await bot.send_message(user_id, f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: {link}")
-                    else:
-                        await bot.send_message(user_id, f"Напоминание: через час встреча {fmt_dt(start_ts)} — {title}\nМесто проведения: (ссылка пока не указана)")
-                elif job_type == "start_notice":
-                    text = "Встреча началась, ждём вас!"
-                    if link.strip():
-                        text += f"\n{link}"
-                    await bot.send_message(user_id, text)
-
-                await db_mark_job_sent(job_id)
-        except:
+                    
+        except Exception:
             pass
         await asyncio.sleep(20)
 
